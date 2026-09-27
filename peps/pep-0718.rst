@@ -23,6 +23,10 @@ subscripted.
 Motivation
 ----------
 
+Function objects in this PEP is used to refer to :class:`~types.FunctionType`\ ,
+:class:`~types.MethodType`\ , :class:`~types.BuiltinFunctionType`\ ,
+:class:`~types.BuiltinMethodType` and :class:`~types.MethodWrapperType`\ .
+
 Currently, classes allow passing type annotations for generic containers. This
 is especially useful in common constructors such as ``list``\, ``tuple`` and ``dict``
 etc.
@@ -184,23 +188,103 @@ Monomorphisation and Reification
 This proposal also opens the door to
 `monomorphisation <https://en.wikipedia.org/wiki/Monomorphization>`_ and
 `reified types <https://en.wikipedia.org/wiki/Reification_(computer_science)>`_.
+Currently getting the specialised types for :py:term:`Generic` types is unintuitive and
+unreliable.
 
-This would allow for a functionality which anecdotally has been requested many times.
+This PEP would allow for a functionality which anecdotally has been requested many times.
+
+- <https://github.com/python/typing/issues/629>
+- <https://mail.python.org/archives/list/typing-sig@python.org/thread/T7VEN5HYHIT5ABNJHYOW434JHELTTKT3/>
+- <https://github.com/python/typing/issues/1544>
 
 *Please note this feature is not being proposed by the PEP, but may be implemented in
 the future.*
 
-The syntax for such a feature may look something like:
+.. code-block:: python
+
+   class Foo[T]: ...
+
+   >>> Foo[int]()  # How do I get `int`?
+
+   >>> Foo[int]().__orig_class__.__args__[0]
+   int
+
+
+This however, doesn't work inside ``__new__``\ /``__init__`` or any methods called from them,
+as ``__orig_class__`` is only set after ``__origin__`` is called and returns.
 
 .. code-block:: python
 
-   def foo[T]():
-      return T.__value__
+   class Bar[T]:
+       def __init__(self):
+           self.__orig_class__
 
-   assert foo[int]() is int
+   >>> Bar[int]()  # AttributeError: Bar has no attribute __orig_class__
+
+
+Accessing type parameters in a generic subclasses
+
+.. code-block:: python
+
+   class Bar(Foo[str]): ...  # how do I now get `str`?
+
+   >>> types.get_original_bases(Bar)[0].__args__
+   (str,)
+
+
+Accessing a type parameter inside a generic function
+
+.. code-block:: python
+
+   >>> def foo[T = str](): ...
+   >>> foo[int]()
+
+
+This isn't even possible without using implementation details/frame hacks.
+
+With the roots of runtime type checking beginning to sprout, this hard-to-use, edge
+case ridden API isn't acceptable.
+
+e.g.
+
+.. code-block:: python
+
+   class Slotted[T]:
+       __slots__ = ()
+
+
+   Slotted[int]().__orig_class__  # AttributeError: 'Slotted' object has no attribute '__orig_class__'
+
+A future PEP may propose an interface design which solves all of the above problems by
+being easy to use and much more reliable:
+
+.. code-block:: python
+
+   >>> Foo[int]().__args__
+   (int,)
+   >>> Foo[int]().T.__value__
+   int
+
+   >>> Bar.__args__
+   (str,)
+   >>> Bar.T.__value__
+   str
+
+   >>> def foo[T  = str]():
+   ...     return T.__value__
+
+   >>> foo()
+   str
+   >>> foo[bool]()
+   bool
+
+This PEP is an important stepping stone for this future as it aims to fix the
+inconsistencies in the type introspection API.
 
 Rationale
 ---------
+
+
 
 This proposal improves the consistency of the type system, by allowing syntax that
 already looks and feels like a natural of the existing syntax for classes.
@@ -210,9 +294,7 @@ If accepted, this syntax will reduce the necessity to learn about :pep:`747`\s
 
 Specification
 -------------
-
-In this PEP "Function objects" is used to refer to ``FunctionType``\ , ``MethodType``\ ,
-``BuiltinFunctionType``\ , ``BuiltinMethodType`` and ``MethodWrapperType``\ .
+.. TODO this is missing stuff for FunctionTypes? Maybe reread docs to double check what should go here?
 
 For ``MethodType`` you should be able to write:
 
@@ -225,9 +307,7 @@ For ``MethodType`` you should be able to write:
 
 and have it work similarly to a ``FunctionType``.
 
-For ``BuiltinFunctionType``, so builtin generic functions (e.g. ``max`` and ``min``)
-work like ones defined in Python. Built-in functions should behave as much like
-functions implemented in Python as possible.
+``BuiltinFunctionType`` (e.g. ``max`` and ``min``) should work like their pure Python counterparts.
 
 ``BuiltinMethodType`` is the same type as ``BuiltinFunctionType``.
 
@@ -236,16 +316,47 @@ generic magic methods.
 
 Function objects should implement ``__getitem__`` to allow for subscription at runtime
 and return an instance of ``types.GenericAlias`` with ``__origin__`` set as the
-callable and ``__args__`` as the types passed.
+callable and ``__args__`` as the types passed. The implementation of ``__getitem__``
+should not currently make any effort to check the types or numbers of arguments passed
+to the subscription. This will allow generic functions in ``.pyi`` files to be used as
+is e.g.
+
+.. code-block:: python
+
+   # old_special_fns.py
+   T = TypeVar("T")
+   def foo_1(bar: T): ...
+   # super_special_fns.py
+   def foo_2(bar, /): ...
+   # super_special_fns.pyi
+   def foo_2[T](bar: T, /) -> T: ...
+   # new_special_fns.py
+   def foo_3[T](bar: T, /): ...
+
+   # special_types.py
+   type SpecialFoo1 = foo_1[int]  # all supported
+   type SpecialFoo2 = foo_2[int]
+   type SpecialFoo3 = foo_3[int]
+
+   foo_123[str, str]  # all work at runtime but type checker complains about too many arguments
+
 
 Type checkers should support subscripting functions and understand that the parameters
 passed to the function subscription should follow the same rules as a generic callable
 class.
 
-Setting ``__orig_class__``
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+.. function_specialised_generic_alias
 
-Currently, ``__orig_class__`` is an attribute set in ``GenericAlias.__call__`` to the
+Implementing ``FunctionSpecialisedGenericAlias``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+A new subclass of :class:`types.GenericAlias` is returned when a function object is
+subscripted, the purpose of which is two fold.
+
+Firstly, this makes it easier to :func:`isinstance` check at runtime whether the
+``__origin__`` comes from one of the five function objects that will have ``__getitem__``
+implemented as part of this PEP.
+
+Secondly, an attribute ``__orig_class__`` is set in ``GenericAlias.__call__`` to the
 instance of the ``GenericAlias`` that created the called class e.g.
 
 .. code-block:: python
@@ -296,6 +407,19 @@ will match only the overloads where the subscription may succeed.
    make[int]  # matches first and second overload
    make[int, str]  # matches only first
 
+   reveal_type(make[int](1))             # type is int | tuple[int]
+   reveal_type(make[int]("foo", "bar"))  # Invalid: no overload for `make[int](x: str, y: str)` found, a similar overload exists but explicit specialisation prevented its use
+
+Overloads should be consistent with their body so the ``serializer_for`` function should also have the same type parameters as their overload.
+
+.. code-block::
+
+   @overload
+   def serializer_for[T: str]() -> StringSerializer: ...
+   @overload
+   def serializer_for[T: list, T2]() -> ListSerializer: ...
+
+   def serializer_for(): ...
 
 Functions Parameterized by ``TypeVarTuple``\ s
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -330,10 +454,11 @@ methods should bind type parameters on attribute access.
        @classmethod
        def cls[U](cls, x: T, y: U): ...
 
-   C[int].method[str](0, "")  # OK
-   C[int].cls[str](0, "")     # OK
-   C.cls[int, str](0, "")     # Invalid: too many type parameters
-   C.cls[str](0, "")          # OK, U will be matched to str
+   C[int]().method[str](0, "")  # OK
+   C[int].cls[str](0, "")       # OK
+   C.cls[int, str](0, "")       # Invalid: too many type parameters
+   C.cls[str](0, "")            # OK, T is bound to int here though this is open for type checkers to decide
+
 
 Backwards Compatibility
 -----------------------
@@ -346,6 +471,18 @@ Reference Implementation
 
 The runtime changes proposed can be found here
 https://github.com/Gobot1234/cpython/tree/function-subscript
+
+Rejected Ideas
+--------------
+
+Implementing a property to check whether a generic alias was created from a function object
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This property checks whether the ``__origin__`` is an instance of a function object. As
+``GenericAlias``\ es forward attribute access to their ``__origin__``, adding this a
+regular method, would be a breaking change.
+
+It was removed in favour of a new subclass as described by :ref:`function_specialised_generic_alias`
 
 Acknowledgements
 ----------------
